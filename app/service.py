@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import sqlite3
 import time
@@ -140,6 +142,45 @@ def build_diff(old: list[dict[str, Any]], new: list[dict[str, Any]]) -> list[dic
 # 销售导入
 # ---------------------------------------------------------------------------
 
+def _is_lock_timeout(exc: sqlite3.Error) -> bool:
+    """SQLite 忙等上限耗尽（SQLITE_BUSY / database is locked）。"""
+    code = getattr(exc, "sqlite_errorcode", None)
+    busy_codes = {sqlite3.SQLITE_BUSY}
+    for name in ("SQLITE_BUSY_TIMEOUT", "SQLITE_BUSY_SNAPSHOT", "SQLITE_BUSY_RECOVERY"):
+        busy_codes.add(getattr(sqlite3, name, sqlite3.SQLITE_BUSY))
+    if code in busy_codes:
+        return True
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _lock_timeout_503(batch_size: int) -> HTTPException:
+    """等锁超时：整批未入仓，客户端可原样重试（重复销售ID自动跳过）。"""
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "warehouse_lock_timeout",
+            "message": f"入仓写锁等待超过 SQLite 忙等上限，整批 {batch_size} 行未入仓，可安全重试",
+            "retryable": True,
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+def import_sales_csv(raw: bytes) -> dict[str, int]:
+    """CSV 上传入口的入仓工作：解码、表头校验、逐行校验、入库，全部在导入执行器线程内完成。"""
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="文件需为 UTF-8 编码 CSV")
+    reader = csv.DictReader(io.StringIO(text))
+    required = {"sale_id", "customer_id", "txn_date", "amount_cents"}
+    if reader.fieldnames is None or not required.issubset({c.strip() for c in reader.fieldnames}):
+        raise HTTPException(status_code=400,
+                            detail=f"CSV 表头需包含 {sorted(required)}，实际为 {reader.fieldnames}")
+    return import_sales(list(reader))
+
+
 def import_sales(rows: list[dict[str, str]]) -> dict[str, int]:
     """CSV 入仓：按当前生效时间线直接计算并持久化归属。
 
@@ -196,8 +237,15 @@ def import_sales(rows: list[dict[str, str]]) -> dict[str, int]:
                 (sale_id, customer_id, txn.isoformat(), amount, version, region, reason, utcnow()),
             )
             inserted += 1
+        # 归属版本在 BEGIN IMMEDIATE 事务内读取，与提交时生效的地区版本严格一致。
         conn.execute("COMMIT")
         return {"inserted": inserted, "skipped_duplicate": skipped, "total": len(parsed)}
+    except sqlite3.OperationalError as exc:
+        # 忙等上限耗尽：整批回滚、不入仓，交由调用方拿到可重试的 503。
+        _safe_rollback(conn)
+        if _is_lock_timeout(exc):
+            raise _lock_timeout_503(len(parsed)) from exc
+        raise
     except Exception:
         _safe_rollback(conn)
         raise

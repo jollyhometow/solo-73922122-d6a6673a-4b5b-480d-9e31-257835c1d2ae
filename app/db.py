@@ -104,13 +104,15 @@ def utcnow() -> str:
 
 
 def get_conn() -> sqlite3.Connection:
-    """每个调用方（请求线程 / 后台回填线程）使用自己的连接。"""
+    """每个调用方（请求线程 / 后台回填线程 / 导入执行器线程）使用自己的连接。"""
     conn = sqlite3.connect(db_path(), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # 自动提交模式，事务全部由代码显式 BEGIN/COMMIT，避免隐式事务与 IMMEDIATE 冲突。
     conn.isolation_level = None
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    # SQLite 原 30 秒忙等待保持不变（默认 30000ms）；仅测试通过环境变量缩短。
+    busy_ms = int(os.environ.get("SALES_BUSY_TIMEOUT_MS", "30000"))
+    conn.execute(f"PRAGMA busy_timeout={busy_ms}")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

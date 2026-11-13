@@ -1,10 +1,10 @@
 """FastAPI 入口：销售导入、查询、地区有效期维护、更正回填与演示入口。"""
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
-import os
 import socket
 import threading
 from pathlib import Path
@@ -15,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import service
 from .db import get_conn, init_db
+from .demo_lock import demo_lock
+from .import_exec import import_executor
 from .sample_data import CORRECTION_SAMPLE_C001, SAMPLE_CSV, SEED_TIMELINES
 from .schemas import CorrectionIn
 
@@ -49,20 +51,36 @@ def health() -> dict[str, str]:
 # 销售导入与查询
 # ---------------------------------------------------------------------------
 
+def _queue_full_503() -> HTTPException:
+    """导入排队已满：瞬态过载，稍后重试（与锁超时同样的可重试 503）。"""
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "import_queue_full",
+            "message": f"导入在途任务已达每进程上限 {import_executor.max_pending}，请稍后重试",
+            "retryable": True,
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+async def _run_import(fn, *args) -> dict:
+    """把整批入仓工作交给导入专用执行器，协程等待结果。
+
+    - 不占 anyio 共享线程池（/api/sales、/api/health 等同步接口不受影响）；
+    - 客户端断连时：排队中的任务被取消（名额归还），已开始的任务在执行器
+      线程内继续跑到整批提交或回滚，连接关闭后名额才释放。
+    """
+    fut = import_executor.submit(fn, *args)
+    if fut is None:
+        raise _queue_full_503()
+    return await asyncio.wrap_future(fut)
+
+
 @app.post("/api/sales/import")
 async def import_sales(file: UploadFile) -> dict:
     raw = await file.read()
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="文件需为 UTF-8 编码 CSV")
-    reader = csv.DictReader(io.StringIO(text))
-    required = {"sale_id", "customer_id", "txn_date", "amount_cents"}
-    if reader.fieldnames is None or not required.issubset({c.strip() for c in reader.fieldnames}):
-        raise HTTPException(status_code=400,
-                            detail=f"CSV 表头需包含 {sorted(required)}，实际为 {reader.fieldnames}")
-    rows = list(reader)
-    result = service.import_sales(rows)
+    result = await _run_import(service.import_sales_csv, raw)
     result["served_by"] = socket.gethostname()
     return result
 
@@ -73,12 +91,12 @@ def sample_csv() -> str:
 
 
 @app.post("/api/sales/import-json")
-def import_sales_json(payload: dict) -> dict:
+async def import_sales_json(payload: dict) -> dict:
     """程序化导入入口（无 multipart 依赖），与 CSV 上传共用同一套入库归属逻辑。"""
     rows = payload.get("rows")
     if not isinstance(rows, list):
         raise HTTPException(status_code=400, detail="请求体需为 {'rows': [{...}, ...]}")
-    result = service.import_sales(rows)
+    result = await _run_import(service.import_sales, rows)
     result["served_by"] = socket.gethostname()
     return result
 
@@ -334,6 +352,43 @@ def correction_template(customer_id: str) -> dict:
         raise HTTPException(status_code=404, detail="内置模板仅提供 C001 的追溯更正样例")
     return {"customer_id": "C001", "entries": CORRECTION_SAMPLE_C001,
             "说明": "生效日由 2026-04-01 提前到 2026-03-01，S1002(2026-03-31) 回填后应改挂华南"}
+
+
+# ---------------------------------------------------------------------------
+# 写锁拥塞演示：可控持锁（nginx 已把 /api/demo/lock 固定路由到 web1）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/demo/lock")
+def demo_lock_acquire(payload: dict) -> dict:
+    """持有 SQLite 写锁 hold_ms 毫秒（到期自动释放），复现入仓写锁拥塞。"""
+    try:
+        hold_ms = int(payload.get("hold_ms", 10000))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="hold_ms 需为整数毫秒")
+    result = demo_lock.acquire(hold_ms, payload.get("note"))
+    result["hint"] = ("写锁持有中：导入会在 SQLite 忙等上限（30s）内等待，超时整批不入仓、"
+                      "返回可重试 503；/api/sales 与 /api/health 不受影响")
+    return result
+
+
+@app.delete("/api/demo/lock")
+def demo_lock_release() -> dict:
+    """提前释放演示写锁。"""
+    return demo_lock.release()
+
+
+@app.get("/api/demo/lock")
+def demo_lock_status() -> dict:
+    return demo_lock.status()
+
+
+@app.get("/api/demo/import-executor")
+def import_executor_status() -> dict:
+    """导入专用执行器观测：名额、在途任务数（验证断连后名额不提前释放）。"""
+    return {"workers": import_executor.workers,
+            "max_pending": import_executor.max_pending,
+            "pending": import_executor.pending,
+            "served_by": socket.gethostname()}
 
 
 # ---------------------------------------------------------------------------

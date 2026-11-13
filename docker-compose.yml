@@ -4,6 +4,10 @@ services:
     container_name: sales-web1
     environment:
       SALES_DB: /data/sales.db
+      # 以下均为默认值，无需设置；仅调参时取消注释：
+      # SALES_BUSY_TIMEOUT_MS: "30000"   # SQLite 原 30 秒忙等待（保持不变）
+      # SALES_IMPORT_WORKERS: "2"        # 每进程导入专用执行器名额（与共享线程池隔离）
+      # SALES_IMPORT_MAX_PENDING: "128"  # 每进程导入在途任务上限（超出返回可重试 503）
     volumes:
       - sales_data:/data
     ports:

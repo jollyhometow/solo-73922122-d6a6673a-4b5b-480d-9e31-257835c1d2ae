@@ -155,6 +155,30 @@
       <pre id="demoOut" style="margin-top:12px"></pre>
     </div>
     <div class="card">
+      <h2>入仓写锁拥塞演示（可控持锁 · 并发导入 · 断连）</h2>
+      <p class="muted">
+        两个导入入口走<b>独立有界执行器</b>（每进程 2 个导入名额 + 有界排队），不再占用服务
+        <code>/api/sales</code>、<code>/api/health</code> 的共享线程池；SQLite 忙等上限保持 30 秒，
+        等锁超时整批不入仓、返回可重试 503；客户端断连后，已开始的批次仍会整批提交或回滚，
+        连接与执行名额在收尾后才释放。典型玩法：先 ① 持锁 35000ms，再 ② 并发导入 40 批
+        （读接口延迟保持 &lt;1s，约 30s 后各批收到 503）；或持锁 8000ms 后 ③ 断连，
+        锁释放后断连批次仍整批入仓。
+      </p>
+      <div class="row">
+        <label class="muted">持锁毫秒 <input type="number" id="lockHoldMs" value="35000" min="100" max="180000" style="width:110px"></label>
+        <button class="act danger" onclick="acquireLock()">① 持有写锁</button>
+        <button class="act sec" onclick="releaseLock()">提前释放</button>
+        <span id="lockStatus" class="muted">写锁空闲</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="act" onclick="runConcurrentImport()">② 并发导入 40 批（探测读延迟）</button>
+        <button class="act" onclick="runDisconnectDemo()">③ 断连演示（1.5s 后中断请求）</button>
+        <button class="act sec" onclick="checkDisconnectBatch()">查询断连批次</button>
+        <button class="act sec" onclick="showImportExecutor()">导入执行器状态</button>
+      </div>
+      <pre id="lockDemoOut" style="margin-top:12px"></pre>
+    </div>
+    <div class="card">
       <h2>推荐演示流程</h2>
       <ol class="muted" style="line-height:1.9">
         <li>点「一键准备演示数据」，到 Tab① 查看 S1002（2026-03-31）当前挂「华东」，S1008 落空档未归属，C003 全部 no_timeline。</li>
@@ -162,6 +186,8 @@
         <li>回填进行中再上传一次 CSV（重复 ID 跳过）或新增销售，验证切换事务会把期间新增销售一并纳入。</li>
         <li>同一客户并发提交第二份更正：第二份返回 409（互斥）；改旧 expected_version 提交则 409 stale_version。</li>
         <li>任务成功后 S1002 改挂「华南」，时间线/销售归属同为 v2；勾选「模拟回填失败」可验证失败后旧版完整保留。</li>
+        <li>写锁拥塞：上方 ① 持锁 35000ms → ② 并发导入 40 批，观察读接口延迟仍 &lt;1s、约 30s 后各批 503（可重试、整批未入仓）；锁释放后重传入仓、再传按销售ID去重。</li>
+        <li>断连：① 持锁 8000ms → ③ 断连演示，1.5s 后浏览器主动中断请求；锁释放后点「查询断连批次」，该批仍整批提交入仓。</li>
         <li>命令行：<code>docker compose restart web1 web2</code> 后数据与版本仍在；两个入口 <code>:8081</code> / <code>:8082</code> 由 nginx <code>:8080</code> 负载均衡。</li>
       </ol>
     </div>
@@ -337,6 +363,114 @@ async function runConsistency() {
   $('demoOut').textContent = JSON.stringify(d, null, 2);
   toast(d.consistent ? '一致性自检通过' : '发现不一致！', d.consistent ? 'ok' : 'err');
 }
+
+// ---------- Tab4 写锁拥塞演示 ----------
+function lockOut(msg) { $('lockDemoOut').textContent = msg; }
+async function refreshLockStatus() {
+  try {
+    const d = await api('/api/demo/lock');
+    $('lockStatus').textContent = d.held
+      ? `🔒 写锁持有中（进程 ${d.host}，${d.hold_ms}ms，始于 ${d.held_since}）`
+      : '写锁空闲';
+    return d;
+  } catch (e) { return { held: false }; }
+}
+setInterval(refreshLockStatus, 1500); refreshLockStatus();
+
+async function acquireLock() {
+  const hold = Number($('lockHoldMs').value || 10000);
+  try {
+    const d = await api('/api/demo/lock', { method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ hold_ms: hold, note: '浏览器演示持锁' }) });
+    toast(`写锁已持有 ${hold}ms（进程 ${d.host}）`, 'info');
+    lockOut(`写锁已持有：${JSON.stringify(d, null, 2)}\n` +
+      `现在可点 ② 并发导入 40 批 或 ③ 断连演示；读接口（明细/健康）应保持 <1s。`);
+    refreshLockStatus();
+  } catch (e) { toast('持锁失败：' + e.message, 'err'); }
+}
+async function releaseLock() {
+  const d = await api('/api/demo/lock', { method:'DELETE' });
+  toast(d.held ? '释放请求已发出' : '写锁已释放', 'ok');
+  refreshLockStatus();
+}
+
+async function runConcurrentImport() {
+  const n = 40, ts = Date.now();
+  const bodies = [];
+  for (let i = 0; i < n; i++) {
+    bodies.push({ rows: [{ sale_id: `CC${ts}-${i}`, customer_id: 'C001',
+                           txn_date: '2026-02-10', amount_cents: 100 + i }] });
+  }
+  let maxHealth = 0, maxSales = 0, stopped = false;
+  const probe = (async () => {
+    while (!stopped) {
+      let t0 = performance.now();
+      try { await fetch('/api/health'); maxHealth = Math.max(maxHealth, performance.now() - t0); } catch (e) {}
+      t0 = performance.now();
+      try { await fetch('/api/sales?limit=1'); maxSales = Math.max(maxSales, performance.now() - t0); } catch (e) {}
+      await new Promise(r => setTimeout(r, 200));
+    }
+  })();
+  lockOut(`并发导入 ${n} 批进行中（批次 CC${ts}-*）…\n期间持续探测 /api/health 与 /api/sales 延迟。`);
+  const t0 = performance.now();
+  const results = await Promise.allSettled(bodies.map(b =>
+    fetch('/api/sales/import-json', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(b) })
+      .then(async r => ({ status: r.status, body: await r.json().catch(() => ({})) }))));
+  stopped = true; await probe;
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+  const ok = results.filter(r => r.status === 'fulfilled' && r.value.status === 200).length;
+  const busy = results.filter(r => r.status === 'fulfilled' && r.value.status === 503).length;
+  const other = results.length - ok - busy;
+  const sample503 = results.find(r => r.status === 'fulfilled' && r.value.status === 503);
+  lockOut(`并发导入 ${n} 批完成：成功 ${ok}，可重试 503 ${busy}，其他 ${other}，总耗时 ${elapsed}s\n` +
+    `导入期间读接口最大延迟：/api/health ${maxHealth.toFixed(0)}ms，/api/sales ${maxSales.toFixed(0)}ms（要求 <1000ms）\n` +
+    (sample503 ? `503 样例：${JSON.stringify(sample503.value.body.detail)}\n` : '') +
+    `提示：持锁 >30s 时各批等锁超时返回 503；持锁较短或无锁时全部入仓。`);
+  loadSales();
+}
+
+let disconnectSaleId = null;
+async function runDisconnectDemo() {
+  const ts = Date.now();
+  disconnectSaleId = `DC${ts}`;
+  const ctrl = new AbortController();
+  const body = { rows: [{ sale_id: disconnectSaleId, customer_id: 'DC001',
+                          txn_date: '2026-02-10', amount_cents: 777 }] };
+  const req = fetch('/api/sales/import-json', { method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body),
+    signal: ctrl.signal }).then(async r => ({ status: r.status, body: await r.json().catch(() => ({})) }));
+  setTimeout(() => ctrl.abort(), 1500);
+  try {
+    const d = await req;
+    lockOut(`批次 ${disconnectSaleId} 在 1.5s 断连前已完成（HTTP ${d.status}，锁空闲时属正常）。\n` +
+      `想观察「断连后仍整批提交」：先 ① 持锁 8000ms 以上，再点本按钮。`);
+  } catch (e) {
+    lockOut(`客户端已在 1.5s 后主动断连（AbortController）。\n` +
+      `批次 ${disconnectSaleId} 的服务端工作不中断：等锁结束后整批提交，或忙等超时整批回滚。\n` +
+      `连接与导入名额在批次收尾后才释放。待写锁释放后点「查询断连批次」验证。`);
+  }
+}
+async function checkDisconnectBatch() {
+  if (!disconnectSaleId) return toast('请先运行断连演示', 'err');
+  const r = await fetch('/api/sales/' + disconnectSaleId);
+  if (r.status === 200) {
+    const d = await r.json();
+    lockOut(`断连批次已整批入仓 ✅\n${JSON.stringify(d, null, 2)}`);
+  } else if (r.status === 404) {
+    lockOut(`批次 ${disconnectSaleId} 尚未入仓：写锁仍持有（等待提交）或已整批回滚（503 场景）。\n` +
+      `请确认写锁已释放后再查。`);
+  } else {
+    lockOut(`查询异常：HTTP ${r.status}`);
+  }
+}
+async function showImportExecutor() {
+  const d = await api('/api/demo/import-executor');
+  lockOut(`导入执行器（本进程 ${d.served_by}）：导入名额 ${d.workers}，在途 ${d.pending}/${d.max_pending}\n` +
+    `断连的运行中批次收尾前，pending 不会提前归还。`);
+}
+
 loadSales();
 </script>
 </body>
