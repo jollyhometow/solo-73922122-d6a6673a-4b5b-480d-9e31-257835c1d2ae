@@ -1,0 +1,44 @@
+services:
+  web1:
+    build: .
+    container_name: sales-web1
+    environment:
+      SALES_DB: /data/sales.db
+    volumes:
+      - sales_data:/data
+    ports:
+      - "8081:8000"          # 直连进程 1，便于验证双进程
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web2:
+    build: .
+    container_name: sales-web2
+    environment:
+      SALES_DB: /data/sales.db
+    volumes:
+      - sales_data:/data
+    ports:
+      - "8082:8000"          # 直连进程 2
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: sales-nginx
+    depends_on:
+      - web1
+      - web2
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:8080"          # 浏览器统一入口（轮询两个 Web 进程）
+
+volumes:
+  sales_data:

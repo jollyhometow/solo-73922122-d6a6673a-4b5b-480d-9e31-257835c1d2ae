@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>销售地区归属 · 追溯更正平台</title>
+<style>
+  :root { --bg:#f5f7fa; --card:#fff; --line:#e3e8ef; --pri:#2563eb; --ok:#16a34a;
+          --warn:#d97706; --err:#dc2626; --muted:#64748b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:#0f172a; }
+  header { background:#0f172a; color:#fff; padding:14px 24px; display:flex;
+           justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+  header h1 { font-size:18px; margin:0; }
+  header .meta { font-size:12px; color:#94a3b8; }
+  nav { display:flex; gap:4px; padding:0 24px; background:#1e293b; }
+  nav button { background:none; border:0; color:#cbd5e1; padding:12px 18px; cursor:pointer;
+               font-size:14px; border-bottom:3px solid transparent; }
+  nav button.active { color:#fff; border-bottom-color:var(--pri); }
+  main { padding:20px 24px; max-width:1280px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:18px; margin-bottom:16px; }
+  .card h2 { margin:0 0 12px; font-size:16px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th,td { border:1px solid var(--line); padding:7px 9px; text-align:left; white-space:nowrap; }
+  th { background:#f8fafc; font-weight:600; }
+  tr.unattr { background:#fef2f2; }
+  button.act { background:var(--pri); color:#fff; border:0; border-radius:7px;
+               padding:8px 14px; cursor:pointer; font-size:13px; }
+  button.act.sec { background:#475569; }
+  button.act.danger { background:var(--err); }
+  button.act:disabled { opacity:.5; cursor:not-allowed; }
+  input,select,textarea { padding:7px 9px; border:1px solid var(--line); border-radius:7px;
+                          font-size:13px; font-family:inherit; }
+  input[type=number] { width:130px; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; }
+  .pill.pending,.pill.running { background:#fef3c7; color:#92400e; }
+  .pill.succeeded { background:#dcfce7; color:#166534; }
+  .pill.failed { background:#fee2e2; color:#991b1b; }
+  .pill.gap { background:#fee2e2; color:#991b1b; }
+  .pill.region { background:#dbeafe; color:#1e40af; }
+  .muted { color:var(--muted); font-size:12px; }
+  .toast { position:fixed; right:24px; bottom:24px; max-width:420px; z-index:99;
+           display:flex; flex-direction:column; gap:8px; }
+  .toast div { padding:11px 15px; border-radius:8px; color:#fff; font-size:13px;
+               box-shadow:0 6px 20px rgba(0,0,0,.18); }
+  .toast .ok { background:var(--ok); } .toast .err { background:var(--err); }
+  .toast .info { background:#334155; }
+  code { background:#f1f5f9; padding:1px 6px; border-radius:4px; font-size:12px; }
+  .seg-grid { display:grid; grid-template-columns: 1fr 1fr 1fr 90px; gap:8px; margin-bottom:8px; }
+  pre { background:#0f172a; color:#e2e8f0; padding:12px; border-radius:8px;
+        font-size:12px; overflow:auto; max-height:340px; }
+  .stat { font-size:13px; }
+  .stat b { font-size:20px; color:var(--pri); }
+</style>
+</head>
+<body>
+<header>
+  <h1>销售地区归属 · 追溯更正平台（FastAPI + SQLite WAL · 双进程）</h1>
+  <div class="meta" id="hostMeta">连接中…</div>
+</header>
+<nav>
+  <button data-tab="sales" class="active">① 销售导入 / 明细</button>
+  <button data-tab="timeline">② 客户地区有效期</button>
+  <button data-tab="jobs">③ 更正与回填任务</button>
+  <button data-tab="demo">④ 演示脚本与自检</button>
+</nav>
+<main>
+  <!-- Tab 1 -->
+  <section id="tab-sales">
+    <div class="card">
+      <h2>ERP 销售 CSV 导入</h2>
+      <p class="muted">表头：<code>sale_id,customer_id,txn_date,amount_cents</code>（金额为整数分）。归属在入仓时按当前生效时间线计算并落库，重复 sale_id 自动跳过。</p>
+      <div class="row">
+        <input type="file" id="csvFile" accept=".csv">
+        <button class="act" onclick="uploadCsv()">上传导入</button>
+        <a class="act sec" style="text-decoration:none" href="/api/sales/sample.csv" download>下载样例 CSV</a>
+        <button class="act sec" onclick="loadSales()">刷新</button>
+        <label class="muted"><input type="checkbox" id="unattrOnly" onchange="loadSales()"> 只看未归属</label>
+        <label class="muted">客户 <input id="salesCid" style="width:110px" placeholder="如 C001"></label>
+        <button class="act sec" onclick="loadSales()">筛选</button>
+      </div>
+      <div id="importResult" class="muted" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <h2>销售明细（归属为入库存储值，查询不重算）</h2>
+      <table id="salesTable"><thead><tr>
+        <th>销售ID</th><th>客户ID</th><th>交易日期</th><th>金额(分)</th>
+        <th>归属版本</th><th>地区</th><th>未归属原因</th><th>入仓时间</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card" id="detailCard" style="display:none">
+      <h2>销售详情（含同版时间线快照）</h2>
+      <pre id="detailJson"></pre>
+    </div>
+  </section>
+
+  <!-- Tab 2 -->
+  <section id="tab-timeline" style="display:none">
+    <div class="card">
+      <h2>按客户替换整套地区有效期</h2>
+      <p class="muted">区间左闭右开 <code>[effective_from, effective_to)</code>，末段可无结束日；重叠拒绝，空档标未归属。提交必须携带当前所见版本 <code>expected_version</code>，过期返回 409，失败保留旧版。</p>
+      <div class="row">
+        <label>客户ID <input id="tlCid" value="C001" style="width:120px"></label>
+        <button class="act sec" onclick="loadTimeline()">载入当前时间线</button>
+        <button class="act sec" onclick="loadCorrectionTpl()">载入 C001 追溯更正模板</button>
+      </div>
+      <div style="margin-top:12px">
+        <div class="seg-grid muted"><span>地区</span><span>生效日(闭)</span><span>失效日(开, 可空)</span><span></span></div>
+        <div id="segRows"></div>
+        <div class="row" style="margin-top:8px">
+          <button class="act sec" onclick="addSeg()">+ 增加一段</button>
+          <label class="muted">回填延迟(毫秒) <input type="number" id="delayMs" value="3000" min="0" max="300000"></label>
+          <label class="muted"><input type="checkbox" id="failSim"> 模拟回填失败（验证旧版保留）</label>
+        </div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="act" onclick="submitCorrection('/api/corrections')">提交追溯更正</button>
+        <span id="tlVersion" class="muted"></span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>修订历史（所见修订随更正携带，切换后整体生效）</h2>
+      <button class="act sec" onclick="loadRevisions()">查看该客户修订</button>
+      <div id="revBox" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <!-- Tab 3 -->
+  <section id="tab-jobs" style="display:none">
+    <div class="card">
+      <h2>回填 / 切换任务</h2>
+      <div class="row">
+        <button class="act sec" onclick="loadJobs()">刷新</button>
+        <label class="muted"><input type="checkbox" id="autoRefresh" checked> 每 2 秒自动刷新（观察回填期间并发）</label>
+      </div>
+      <table id="jobsTable" style="margin-top:10px"><thead><tr>
+        <th>任务</th><th>客户</th><th>状态</th><th>版本 v→v'</th><th>进度(已暂存/总数)</th>
+        <th>延迟ms</th><th>提交时间</th><th>完成时间</th><th>错误/备注</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- Tab 4 -->
+  <section id="tab-demo" style="display:none">
+    <div class="card">
+      <h2>一键准备演示数据</h2>
+      <p class="muted">C001：华东(2026-01-01~04-01)→华南；C002：华北/西南，中间 5 月空档；C003：无时间线。样例销售含跨 2026-04-01 生效日记录。</p>
+      <div class="row">
+        <button class="act" onclick="seedDemo()">幂等灌入样例</button>
+        <button class="act sec" onclick="runConsistency()">运行一致性自检</button>
+      </div>
+      <pre id="demoOut" style="margin-top:12px"></pre>
+    </div>
+    <div class="card">
+      <h2>推荐演示流程</h2>
+      <ol class="muted" style="line-height:1.9">
+        <li>点「一键准备演示数据」，到 Tab① 查看 S1002（2026-03-31）当前挂「华东」，S1008 落空档未归属，C003 全部 no_timeline。</li>
+        <li>Tab② 载入 C001 追溯更正模板，回填延迟设 8000ms，提交；立刻回 Tab① 持续刷新——回填期间仍可导入销售、查询旧结果。</li>
+        <li>回填进行中再上传一次 CSV（重复 ID 跳过）或新增销售，验证切换事务会把期间新增销售一并纳入。</li>
+        <li>同一客户并发提交第二份更正：第二份返回 409（互斥）；改旧 expected_version 提交则 409 stale_version。</li>
+        <li>任务成功后 S1002 改挂「华南」，时间线/销售归属同为 v2；勾选「模拟回填失败」可验证失败后旧版完整保留。</li>
+        <li>命令行：<code>docker compose restart web1 web2</code> 后数据与版本仍在；两个入口 <code>:8081</code> / <code>:8082</code> 由 nginx <code>:8080</code> 负载均衡。</li>
+      </ol>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let currentVersion = null, currentCid = null;
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  ['sales','timeline','jobs','demo'].forEach(t =>
+    $('tab-' + t).style.display = t === b.dataset.tab ? '' : 'none');
+  if (t_check(b,'jobs')) loadJobs();
+});
+function t_check(b, name){ return b.dataset.tab === name; }
+
+function toast(msg, kind='info') {
+  const el = document.createElement('div');
+  el.className = kind; el.textContent = msg;
+  $('toast').appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) { throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)); }
+  return data;
+}
+async function refreshHost() {
+  try { const h = await api('/api/health'); $('hostMeta').textContent = '当前响应进程：' + h.host; } catch(e) {}
+}
+setInterval(refreshHost, 4000); refreshHost();
+
+// ---------- Tab1 销售 ----------
+async function uploadCsv() {
+  const f = $('csvFile').files[0];
+  if (!f) return toast('请先选择 CSV 文件', 'err');
+  const fd = new FormData(); fd.append('file', f);
+  try {
+    const d = await fetch('/api/sales/import', { method: 'POST', body: fd }).then(async r => {
+      const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j.detail)); return j;
+    });
+    $('importResult').innerHTML = `导入完成：新增 <b>${d.inserted}</b> 条，重复跳过 ${d.skipped_duplicate} 条，共 ${d.total} 条（进程 ${d.served_by}）`;
+    toast('导入成功', 'ok'); loadSales();
+  } catch (e) { toast('导入失败：' + e.message, 'err'); }
+}
+async function loadSales() {
+  const p = new URLSearchParams();
+  if ($('unattrOnly').checked) p.set('unattributed_only', '1');
+  if ($('salesCid').value.trim()) p.set('customer_id', $('salesCid').value.trim());
+  const d = await api('/api/sales?' + p);
+  const tb = $('salesTable').querySelector('tbody'); tb.innerHTML = '';
+  d.items.forEach(s => {
+    const tr = document.createElement('tr');
+    if (!s.region) tr.className = 'unattr';
+    const reason = s.unattributed_reason
+      ? `<span class="pill gap">${s.unattributed_reason}</span> ${s.unattributed_reason_text ?? ''}` : '';
+    tr.innerHTML = `<td>${s.sale_id}</td><td>${s.customer_id}</td><td>${s.txn_date}</td>
+      <td>${s.amount_cents}</td><td>v${s.region_version}</td>
+      <td>${s.region ? `<span class="pill region">${s.region}</span>` : '—'}</td>
+      <td>${reason || '—'}</td><td>${s.imported_at}</td>
+      <td><button class="act sec" onclick="showDetail('${s.sale_id}')">详情</button></td>`;
+    tb.appendChild(tr);
+  });
+}
+async function showDetail(id) {
+  const d = await api('/api/sales/' + id);
+  $('detailCard').style.display = '';
+  $('detailJson').textContent = JSON.stringify(d, null, 2);
+  $('detailCard').scrollIntoView({ behavior: 'smooth' });
+}
+
+// ---------- Tab2 时间线 ----------
+function segRow(e = {region:'', effective_from:'', effective_to:''}) {
+  const div = document.createElement('div');
+  div.className = 'seg-grid';
+  div.innerHTML = `<input placeholder="地区" value="${e.region ?? ''}">
+    <input type="date" value="${e.effective_from ?? ''}">
+    <input type="date" value="${e.effective_to ?? ''}">
+    <button class="act danger" onclick="this.parentElement.remove()">删除</button>`;
+  $('segRows').appendChild(div);
+}
+function addSeg(){ segRow(); }
+async function loadTimeline() {
+  const cid = $('tlCid').value.trim(); if (!cid) return;
+  const d = await api('/api/timeline/' + cid);
+  currentCid = cid; currentVersion = d.version;
+  $('segRows').innerHTML = '';
+  d.entries.forEach(segRow);
+  if (!d.entries.length) segRow();
+  $('tlVersion').textContent = `当前生效版本 v${d.version}（提交时 expected_version=${d.version}）` +
+    (d.backfill.length ? `；⚠ 该客户存在进行中的回填 v${d.backfill[0].version}` : '');
+  loadRevisions();
+}
+async function loadCorrectionTpl() {
+  const d = await api('/api/demo/correction-template/C001');
+  $('tlCid').value = 'C001';
+  const cur = await api('/api/timeline/C001');
+  currentCid = 'C001'; currentVersion = cur.version;
+  $('segRows').innerHTML = '';
+  d.entries.forEach(segRow);
+  $('tlVersion').textContent = `当前生效版本 v${cur.version}（模板为追溯更正，提交携带 v${cur.version}）`;
+}
+function collectEntries() {
+  return [...$('segRows').children].map(g => {
+    const inputs = g.querySelectorAll('input');
+    return { region: inputs[0].value.trim(), effective_from: inputs[1].value,
+             effective_to: inputs[2].value || null };
+  });
+}
+async function submitCorrection(url) {
+  if (!currentCid) currentCid = $('tlCid').value.trim();
+  const body = {
+    customer_id: currentCid,
+    expected_version: currentVersion,
+    entries: collectEntries(),
+    backfill_delay_ms: Number($('delayMs').value || 0),
+    fail_simulation: $('failSim').checked,
+    note: '浏览器提交的追溯更正'
+  };
+  try {
+    const d = await api(url, { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body) });
+    toast(`更正已受理 job=${d.job_id}，新版本 v${d.new_version}`, 'ok');
+    setTimeout(loadJobs, 500);
+    document.querySelector('nav button[data-tab=jobs]').click();
+  } catch (e) { toast('提交被拒绝：' + e.message, 'err'); }
+}
+async function loadRevisions() {
+  const cid = ($('tlCid').value || '').trim(); if (!cid) return;
+  const d = await api('/api/revisions/' + cid);
+  if (!d.revisions.length) { $('revBox').innerHTML = '<span class="muted">暂无修订记录</span>'; return; }
+  $('revBox').innerHTML = d.revisions.map(r => `
+    <div class="card" style="margin-bottom:8px">
+      <b>v${r.version}</b>（取代 v${r.supersedes_version}） 生效于 ${r.activated_at}
+      ${r.note ? `· ${r.note}` : ''}
+      <table style="margin-top:8px"><thead><tr><th>操作</th><th>地区</th><th>生效日</th><th>失效日</th></tr></thead>
+      <tbody>${r.diff.map(x => `<tr><td>${x.op === 'added' ? '新增' : '移除'}</td>
+        <td>${x.region}</td><td>${x.effective_from}</td><td>${x.effective_to ?? '∞'}</td></tr>`).join('')}
+      </tbody></table>
+    </div>`).join('');
+}
+
+// ---------- Tab3 任务 ----------
+async function loadJobs() {
+  const d = await api('/api/corrections');
+  const tb = $('jobsTable').querySelector('tbody'); tb.innerHTML = '';
+  d.jobs.forEach(j => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>#${j.id}</td><td>${j.customer_id}</td>
+      <td><span class="pill ${j.status}">${j.status}</span></td>
+      <td>v${j.expected_version} → v${j.new_version}</td>
+      <td>${j.staged_sales}/${j.total_sales}</td><td>${j.backfill_delay_ms}</td>
+      <td>${j.submitted_at}</td><td>${j.finished_at ?? '—'}</td>
+      <td>${j.error ?? (j.note ?? '')}</td>`;
+    tb.appendChild(tr);
+  });
+}
+setInterval(() => { if ($('autoRefresh').checked && $('tab-jobs').style.display !== 'none') loadJobs(); }, 2000);
+
+// ---------- Tab4 ----------
+async function seedDemo() {
+  const d = await api('/api/demo/seed', { method:'POST' });
+  $('demoOut').textContent = JSON.stringify(d, null, 2);
+  toast('样例数据已就绪', 'ok'); loadSales();
+}
+async function runConsistency() {
+  const d = await api('/api/consistency');
+  $('demoOut').textContent = JSON.stringify(d, null, 2);
+  toast(d.consistent ? '一致性自检通过' : '发现不一致！', d.consistent ? 'ok' : 'err');
+}
+loadSales();
+</script>
+</body>
+</html>
